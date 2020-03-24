@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include <regex.h>
 #ifdef HAVE_PCRE
@@ -828,7 +829,8 @@ static int func_inject(struct filter_op *fop, struct packet_object *po)
  */
 static int func_execinject(struct filter_op *fop, struct packet_object *po)
 {
-   FILE *pstream = NULL;
+   int child_stdout[2], child_stdin[2];
+   pid_t child_pid;
    unsigned char *output = NULL;
    size_t n = 0, offset = 0, size = 128;
    unsigned char buf[size];
@@ -841,12 +843,41 @@ static int func_execinject(struct filter_op *fop, struct packet_object *po)
    DEBUG_MSG("filter engine: func_execinject %s", fop->op.func.string);
    
    /* open the pipe */
-   if ((pstream = popen((const char*)fop->op.func.string, "r")) == NULL) {
-      USER_MSG("filter engine: execinject(): Command not found (%s)\n", fop->op.func.string);
+   if (pipe(child_stdin) != 0 || pipe(child_stdout) != 0) {
+      USER_MSG("filter engine: execinject(): failed to create pipes\n");
       return -E_FATAL;
    }
+   if ((child_pid = fork()) < 0) {
+      USER_MSG("filter engine: execinject(): failed to fork\n");
+      return -E_FATAL;
+   }
+   if (child_pid == 0) {
+       char *const argv[] = { "/bin/bash", "-c", (const char*)fop->op.func.string };
+       if (dup2(child_stdin[0], STDIN_FILENO) == -1 || dup2(child_stdout[1], STDOUT_FILENO) == -1) {
+           exit(EXIT_FAILURE);
+       }
+       close(child_stdin[1]);
+       close(child_stdout[0]);
+
+       execv(argv[0], argv);
+       exit(EXIT_FAILURE);
+   }
+
+   close(child_stdin[0]);
+   close(child_stdout[1]);
+   /* fill child STDIN with DATA */
+   while (offset < po->DATA.len) {
+       n = write(child_stdin[1], po->DATA.data + offset, po->DATA.len - offset);
+       if (n == (size_t)-1) {
+           break;
+       }
+       offset += n;
+   }
+   close(child_stdin[1]);
    
-   while ((n = read(fileno(pstream), buf, size)) != 0) {
+   /* Fill child STDIN with DATA */
+   offset = 0;
+   while ((n = read(child_stdout[0], buf, size)) != 0) {
       if (output == NULL) {
          SAFE_CALLOC(output, offset+n, sizeof(unsigned char));
       }
@@ -857,9 +888,8 @@ static int func_execinject(struct filter_op *fop, struct packet_object *po)
       memcpy(output+offset, buf, n);
       offset += n;
    }
-   
    /* close pipe stream */
-   pclose(pstream);
+   close(child_stdout[0]);
 
    /* check if we are overflowing pcap buffer */
    if(EC_GBL_PCAP->snaplen - (po->L4.header - (po->packet + po->L2.len) + po->L4.len) <= po->DATA.len + (unsigned)offset)
